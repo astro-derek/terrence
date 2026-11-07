@@ -1,5 +1,28 @@
+# Python environments and caches
 .venv/
+venv/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging output
+/build/
+/dist/
 *.egg-info/
+.eggs/
+
+# Coverage output
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local client state and downloaded content
 .terrence/
+.torrenting/
 downloads/
+
+# PowerShell runtime cache created in the workspace
+/Microsoft/Windows/PowerShell/
