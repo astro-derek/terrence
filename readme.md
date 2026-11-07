@@ -98,3 +98,26 @@ Linux/macOS support uses the same client with POSIX process and locking support.
 
 Tests use generated torrent metadata and local payload files; they do not
 download public torrents.
+
+## Search EXT
+
+```sh
+torrenting search linux
+torrenting search "linux distribution" --page 2 --limit 10
+torrenting search linux --json
+```
+
+Search reads `https://ext.to/search/` and prints titles, detail-page URLs,
+size, seeders, and leechers when available. `--page` selects a positive page
+number; `--limit` caps that page's displayed results (1–100, default 20).
+Search does not start a background worker or add downloads. Open a result's
+URL to obtain a torrent file or magnet URI, then use the existing `add`
+command. JSON output contains `title`, `url`, `size`, `seeders`, and `leechers`;
+unavailable metadata is `null`.
+
+EXT must be reachable through your network policy. HTTP errors and
+unrecognized pages (including access challenges) are reported as errors rather
+than empty results. This integration reads HTML, so site layout changes may
+require parser updates. Live compatibility has not yet been verified in this
+cloud environment because its network policy blocks EXT; parser and request
+tests use representative HTML, not a captured live response.
