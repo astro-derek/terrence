@@ -5,6 +5,15 @@ from pathlib import Path
 from .client import request
 
 
+def format_eta(seconds):
+    if seconds is None:
+        return '-'
+    # Round up so an unfinished minute is still shown as time remaining.
+    minutes = (max(0, int(seconds)) + 59) // 60
+    hours, minutes = divmod(minutes, 60)
+    return f'{hours}h {minutes:02d}m'
+
+
 def print_torrents(torrents):
     headings = ['ID', 'ALIAS', 'STATUS', 'PROGRESS', 'DOWN KiB/s', 'UP KiB/s', 'ETA', 'NAME']
     rows = [
@@ -12,7 +21,7 @@ def print_torrents(torrents):
          f"{row.get('progress', 0):.1%}",
          f"{row.get('download_rate', 0) / 1024:.1f}",
          f"{row.get('upload_rate', 0) / 1024:.1f}",
-         str(row['eta']) if row.get('eta') is not None else '-', row.get('name', '')]
+         format_eta(row.get('eta')), row.get('name', '')]
         for row in torrents
     ]
     widths = [max(len(values[index]) for values in [headings, *rows])
@@ -82,11 +91,16 @@ def main():
                '  terrence info example\n'
                '  terrence pause 1\n'
                '  terrence resume 1\n'
+               '  terrence settings --auto-start false\n'
+               '  terrence add torrent "later.torrent" --no-start\n'
                '  terrence shutdown\n\n'
-               'State: .terrence/ in the current directory; files: downloads/<id>/.\n'
+               'Defaults: terrence.json; state: .terrence/ in the current directory.\n'
+               'Files: downloads/<id>/ unless download_directory is configured.\n'
                'Each directory manages its own torrents. IDs persist; aliases are optional.\n'
                'Commands start a background worker when needed, including list and info.\n'
                'Completed torrents stop seeding by default.\n\n'
+               'Edit terrence.json or use terrence settings to change defaults.\n'
+               'Manual edits apply on the next command; explicit add flags override defaults.\n\n'
                'Run terrence <command> --help for details and more examples.')
     commands = parser.add_subparsers(dest='command', required=True, title='commands', metavar='COMMAND')
 
@@ -96,19 +110,28 @@ def main():
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog='Examples:\n' + '\n'.join(f'  terrence {example}' for example in examples))
 
-    add = command_help('add', 'Add and immediately start a torrent or magnet link',
+    add = command_help('add', 'Add a torrent or magnet link using directory defaults',
                        'Add a local .torrent file, an HTTP(S) torrent URL, or a magnet URI.\n'
                        'Quote sources containing spaces or shell characters such as &.\n'
-                       'Files are saved to downloads/<id>/ in the current directory.',
+                       'Start behavior and download folder use defaults from terrence.json.\n'
+                       'Use --start or --no-start to override auto_start for this torrent.',
                        ['add torrent "example.torrent" --alias example',
+                        'add torrent "later.torrent" --alias later --no-start',
+                        'add torrent "example.torrent" --start',
                         'add torrent "https://example.org/example.torrent"',
                         'add magnet "magnet:?xt=urn:btih:<info-hash>" --alias other'])
     add.add_argument('kind', choices=['torrent', 'magnet'], help='Use torrent for a file/URL, or magnet for a magnet URI')
     add.add_argument('source', help='Local .torrent path, HTTP(S) torrent URL, or complete magnet URI')
     add.add_argument('--alias', metavar='NAME', help='Optional unique nickname in this directory; cannot be purely numeric')
+    starting = add.add_mutually_exclusive_group()
+    starting.add_argument('--start', dest='start', action='store_true', default=None,
+                          help='Start immediately, overriding auto_start in terrence.json')
+    starting.add_argument('--no-start', dest='start', action='store_false',
+                          help='Add stopped, overriding auto_start in terrence.json')
     listing = command_help('list', 'List torrents, progress, speeds, and ETA',
                            'Show torrents managed in the current directory.\n'
-                           'Speeds are KiB/s; ETA is seconds (- when unknown).',
+                           'Speeds are KiB/s; ETA is hours and minutes remaining (e.g. 2h 05m).\n'
+                           'Partial minutes round up; unknown ETA is -. JSON keeps ETA in seconds.',
                            ['list', 'list --json'])
     listing.add_argument('--json', action='store_true', help='Print JSON instead of a table; unknown values are null')
     info = command_help('info', 'Inspect peers, trackers, files, and torrent metadata',
@@ -122,6 +145,7 @@ def main():
     actions = {
         'start': ('Start or restart a torrent',
                   'Start a stopped torrent or restart a paused/completed torrent.\n'
+                  'Use the torrent\'s saved download path, even if directory defaults changed.\n'
                   'Existing pieces may be checked; completed torrents require seeding enabled to keep running.'),
         'stop': ('Stop transfers and release torrent resources',
                  'Stop downloading and seeding, removing the torrent from the active session.\n'
@@ -150,13 +174,33 @@ def main():
     alias.add_argument('target', help='Persistent numeric ID or current alias from list')
     alias.add_argument('name', nargs='?', metavar='NAME', help='New unique nickname; omit to clear the current alias')
     settings = command_help('settings', 'Show or change this directory\'s settings',
-                            'With no options, show current settings. Changes apply only to this directory.\n'
+                            'Read defaults from terrence.json in the current working directory.\n'
+                            'The file is created automatically. Edit it or use these options.\n'
+                            'No options: show effective settings, including defaults for omitted keys.\n'
+                            'CLI changes are saved and applied immediately; manual edits load on the next command.\n'
+                            'Unknown keys, invalid types, and invalid values are rejected.\n'
+                            'Download directory and auto-start changes affect new torrents only.\n'
+                            'Existing files are not moved. Rate limits apply to the whole session.\n'
                             'Completed torrents stop seeding by default. Enabling seeding does not\n'
                             'restart completed torrents automatically; use start on those torrents.',
-                            ['settings', 'settings --seed-completed true',
+                            ['settings', 'settings --auto-start false',
+                             'settings --download-directory incoming --download-rate-limit 1048576',
+                             'settings --upload-rate-limit 262144',
+                             'settings --download-rate-limit 0 --enable-dht false',
+                             'settings --seed-completed true',
                              'settings --seed-completed false', 'start example'])
     settings.add_argument('--seed-completed', choices=['true', 'false'],
                           help='Continue seeding after completion: true to enable, false to stop (default setting: false)')
+    settings.add_argument('--auto-start', choices=['true', 'false'],
+                          help='Start newly added torrents automatically (default: true)')
+    settings.add_argument('--download-directory', metavar='PATH',
+                          help='Relative subdirectory inside the working directory, outside .terrence and .git; new torrents only (default: downloads)')
+    settings.add_argument('--download-rate-limit', type=int, metavar='BYTES_PER_SECOND',
+                          help='Combined download limit, 0..2147483647 bytes/second; 0 = unlimited (default)')
+    settings.add_argument('--upload-rate-limit', type=int, metavar='BYTES_PER_SECOND',
+                          help='Combined upload limit, 0..2147483647 bytes/second; 0 = unlimited (default)')
+    settings.add_argument('--enable-dht', choices=['true', 'false'],
+                          help='Enable DHT peer discovery (default: true)')
     command_help('shutdown', 'Stop this directory\'s background worker and transfers',
                  'Stop the background worker for the current directory, preserving state and files.\n'
                  'The next command starts it again and restores previously active torrents.\n'

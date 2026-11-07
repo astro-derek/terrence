@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import hashlib
 import time
+import json
 from pathlib import Path
 
 import libtorrent as lt
@@ -76,7 +77,64 @@ class ClientTests(unittest.TestCase):
         result = self.engine.dispatch(dict(command='settings', seed_completed='true'))
         self.assertTrue(result['seed_completed'])
         other = Engine(self.root)
-        self.assertTrue(other.state['settings']['seed_completed'])
+        self.assertTrue(other.settings['seed_completed'])
+
+    def test_file_defaults_and_live_reload(self):
+        path = self.root / 'terrence.json'
+        self.assertTrue(path.exists())
+        path.write_text(json.dumps({'auto_start': False, 'download_directory': 'incoming',
+                                    'download_rate_limit': 1048576, 'enable_dht': False}))
+        row = self.add()
+        self.assertEqual(row['status'], 'stopped')
+        self.assertNotIn(row['id'], self.engine.handles)
+        self.assertEqual(Path(row['save_path']), self.root / 'incoming' / '1')
+        self.assertEqual(self.engine.session.get_settings()['download_rate_limit'], 1048576)
+        self.assertFalse(self.engine.session.get_settings()['enable_dht'])
+        self.engine.dispatch(dict(command='settings', download_directory='elsewhere'))
+        self.engine.dispatch(dict(command='start', target='1'))
+        self.assertEqual(Path(self.engine.handles[1].status().save_path), self.root / 'incoming' / '1')
+
+    def test_invalid_settings_and_cli_updates(self):
+        path = self.root / 'terrence.json'
+        original = path.read_text()
+        for updates in ({'upload_rate_limit': -1}, {'auto_start': 'invalid'},
+                        {'download_directory': '../outside'}):
+            with self.assertRaises(ValueError):
+                self.engine.dispatch(dict(command='settings', **updates))
+            self.assertEqual(path.read_text(), original)
+        for values in ({'unknown': 1}, {'enable_dht': 'false'}, {'upload_rate_limit': True}, []):
+            path.write_text(json.dumps(values))
+            with self.assertRaises(ValueError):
+                self.engine.dispatch(dict(command='list'))
+        path.write_text('{broken')
+        with self.assertRaisesRegex(ValueError, 'Invalid'):
+            self.engine.dispatch(dict(command='list'))
+        path.write_text(original)
+
+    def test_start_override_and_custom_directory_removal(self):
+        self.engine.dispatch(dict(command='settings', auto_start='false', download_directory='incoming'))
+        row = self.engine.dispatch(dict(command='add', kind='torrent', source=str(self.source), start=True))
+        self.assertEqual(row['status'], 'running')
+        self.engine.dispatch(dict(command='stop', target='1'))
+        folder = self.root / 'incoming' / '1'
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / 'payload.txt').write_text('test')
+        self.engine.dispatch(dict(command='settings', download_directory='elsewhere'))
+        self.engine.dispatch(dict(command='remove', target='1', delete_files=True))
+        self.assertFalse(folder.exists())
+        self.engine.dispatch(dict(command='settings', auto_start='true'))
+        row = self.engine.dispatch(dict(command='add', kind='torrent', source=str(self.source), start=False))
+        self.assertEqual(row['status'], 'stopped')
+
+    def test_legacy_settings_migration(self):
+        isolated = self.root / 'legacy'
+        (isolated / '.terrence').mkdir(parents=True)
+        (isolated / '.terrence' / 'state.json').write_text(json.dumps({
+            'next_id': 1, 'settings': {'seed_completed': True}, 'torrents': []}))
+        other = Engine(isolated)
+        self.assertTrue(other.settings['seed_completed'])
+        self.assertTrue(json.loads((isolated / 'terrence.json').read_text())['seed_completed'])
+        self.assertNotIn('settings', other.state)
 
     def test_info_active_and_stopped(self):
         self.add()

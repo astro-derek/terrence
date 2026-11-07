@@ -9,6 +9,9 @@ from pathlib import Path
 
 
 def request(root, message, start=True):
+    if message['command'] != 'shutdown' and (Path(root) / 'terrence.json').exists():
+        from .settings import read_settings
+        read_settings(root)
     directory = Path(root) / '.terrence'
     def connect():
         endpoint = json.loads((directory / 'endpoint.json').read_text())

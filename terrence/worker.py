@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import libtorrent as lt
+from .settings import DEFAULTS, read_settings, validate
 
 
 def write_json(path, value):
@@ -28,17 +29,32 @@ class Engine:
         self.path = self.directory / 'state.json'
         self.state = json.loads(self.path.read_text()) if self.path.exists() else {
             'next_id': 1, 'settings': {'seed_completed': False}, 'torrents': []}
+        self.settings_path = self.root / 'terrence.json'
+        if not self.settings_path.exists():
+            write_json(self.settings_path, validate(self.state.get('settings', {}), self.root))
+        self.settings = read_settings(self.root)
+        self.state.pop('settings', None)
         self.session = lt.session({'listen_interfaces': '0.0.0.0:0', 'enable_dht': True})
+        self.apply_settings()
         self.handles = {}
         self.lock = threading.RLock()
         self.running = True
-        (self.root / 'downloads').mkdir(exist_ok=True)
+        (self.root / self.settings['download_directory']).mkdir(parents=True, exist_ok=True)
         for row in self.state['torrents']:
+            row.setdefault('save_path', str((self.root / 'downloads' / str(row['id'])).resolve()))
             if row['status'] != 'stopped':
                 try:
                     self.attach(row)
                 except Exception as error:
                     row['error'] = str(error)
+        self.save()
+
+    def apply_settings(self):
+        self.session.apply_settings({key: self.settings[key] for key in
+                                     ('download_rate_limit', 'upload_rate_limit', 'enable_dht')})
+
+    def download_path(self, row):
+        return Path(row.get('save_path', self.root / 'downloads' / str(row['id'])))
 
     def save(self):
         write_json(self.path, self.state)
@@ -49,7 +65,7 @@ class Engine:
         else:
             params = lt.add_torrent_params()
             params.ti = lt.torrent_info(str(self.directory / f"{row['id']}.torrent"))
-        params.save_path = str(self.root / 'downloads' / str(row['id']))
+        params.save_path = str(self.download_path(row))
         params.flags &= ~lt.torrent_flags.auto_managed
         params.flags &= ~lt.torrent_flags.paused
         return params
@@ -87,7 +103,7 @@ class Engine:
                        if status.download_rate else None)
             if status.errc.value():
                 row['error'] = status.errc.message()
-            if status.is_seeding and row['status'] == 'running' and not self.state['settings']['seed_completed']:
+            if status.is_seeding and row['status'] == 'running' and not self.settings['seed_completed']:
                 handle.pause()
                 row['status'] = 'completed'
                 changed = True
@@ -97,13 +113,16 @@ class Engine:
 
     def dispatch(self, message):
         with self.lock:
+            if message['command'] != 'shutdown':
+                self.settings = read_settings(self.root)
+                self.apply_settings()
             return self.command(message)
 
     def info(self, row):
         self.tick()
         result = dict(row)
         handle = self.handles.get(row['id'])
-        result.update(save_path=str(self.root / 'downloads' / str(row['id'])),
+        result.update(save_path=str(self.download_path(row)),
                       live=handle is not None, connected_peers=0, connected_seeds=0,
                       connected_leechers=0, known_peers=None, known_seeds=None,
                       tracker_seeds=None, tracker_leechers=None,
@@ -167,16 +186,28 @@ class Engine:
             self.running = False
             return 'Background client stopped'
         if command == 'settings':
-            value = message.get('seed_completed')
-            if value is not None:
-                self.state['settings']['seed_completed'] = value == 'true'
-                self.save()
-            return self.state['settings']
+            updates = {key: message[key] for key in DEFAULTS if message.get(key) is not None}
+            for key in ('seed_completed', 'auto_start', 'enable_dht'):
+                if key in updates and isinstance(updates[key], str):
+                    if updates[key] not in ('true', 'false'):
+                        raise ValueError(f'{key} must be true or false')
+                    updates[key] = updates[key] == 'true'
+            settings = validate({**self.settings, **updates}, self.root)
+            if updates:
+                write_json(self.settings_path, settings)
+                self.settings = settings
+                self.apply_settings()
+            return settings
         if command == 'add':
             self.validate_alias(message.get('alias'))
             number = self.state['next_id']
             source = message['source']
-            row = dict(id=number, alias=message.get('alias'), kind=message['kind'], source=source, status='running')
+            auto_start = message.get('start')
+            if auto_start is None:
+                auto_start = self.settings['auto_start']
+            row = dict(id=number, alias=message.get('alias'), kind=message['kind'], source=source,
+                       status='running' if auto_start else 'stopped',
+                       save_path=str((self.root / self.settings['download_directory'] / str(number)).resolve()))
             if row['kind'] == 'torrent':
                 if urlparse(source).scheme in ('http', 'https'):
                     with urlopen(source, timeout=15) as response:
@@ -195,7 +226,8 @@ class Engine:
                     (self.directory / f'{number}.torrent').unlink(missing_ok=True)
                 raise ValueError('Torrent is already managed')
             row['fingerprint'] = fingerprint
-            self.attach(row)
+            if auto_start:
+                self.attach(row)
             self.state['torrents'].append(row)
             self.state['next_id'] += 1
             self.save()
@@ -208,7 +240,7 @@ class Engine:
         elif command == 'remove':
             if message.get('delete_files'):
                 # Dedicated numeric directories prevent deleting another torrent's data.
-                folder = self.root / 'downloads' / str(number)
+                folder = self.download_path(row)
                 if folder.is_symlink() or not folder.resolve().is_relative_to(self.root.resolve()):
                     raise ValueError('Download path is outside the workspace')
             if number in self.handles:

@@ -16,6 +16,8 @@ Terrence from the same directory to manage the same torrents.
 - Export listings and detailed information as JSON.
 - Remove torrents with optional file deletion.
 - Configure whether completed torrents continue seeding.
+- Set directory-local defaults in `terrence.json` for auto-start, download location,
+  session transfer limits, and DHT discovery.
 
 ## Requirements
 
@@ -100,7 +102,19 @@ terrence pause example
 terrence resume example
 ```
 
-Adding a torrent starts it immediately. HTTP(S) torrent URLs and magnet links
+To configure defaults before adding torrents:
+
+```sh
+terrence settings --download-directory incoming --auto-start false
+terrence add torrent "example.torrent" --alias later
+terrence start later
+```
+
+The example adds the torrent stopped and saves it under `incoming/<id>/`.
+
+Adding a torrent starts it immediately by default. Use `--no-start` to add it
+stopped, or `--start` to override a disabled auto-start default.
+HTTP(S) torrent URLs and magnet links
 are also accepted; replace these placeholders with actual sources:
 
 ```sh
@@ -116,8 +130,8 @@ directory, and cannot be purely numeric.
 
 | Command | Behavior |
 | --- | --- |
-| `add torrent <file-or-url> [--alias <name>]` | Add and start a local torrent file or HTTP(S) torrent URL. |
-| `add magnet <uri> [--alias <name>]` | Add and start a magnet link. |
+| `add torrent <file-or-url> [--alias <name>] [--start / --no-start]` | Add a torrent file or HTTP(S) URL using directory defaults, with an optional start override. |
+| `add magnet <uri> [--alias <name>] [--start / --no-start]` | Add a magnet link using directory defaults, with an optional start override. |
 | `list [--json]` | Show managed torrents, status, progress, speeds, and ETA. |
 | `info <target> [--json]` | Show detailed information with file and tracker tables. |
 | `pause <target>` | Pause activity while retaining the torrent in the session. |
@@ -129,14 +143,22 @@ directory, and cannot be purely numeric.
 | `settings` | Show this directory's settings. |
 | `settings --seed-completed true` | Allow active torrents to continue seeding after completion. |
 | `settings --seed-completed false` | Stop seeding on completion (default). |
+| `settings --auto-start true/false` | Set whether new torrents start automatically. |
+| `settings --download-directory <path>` | Set the relative download folder for new torrents. |
+| `settings --download-rate-limit <bytes-per-second>` | Set the session download limit; `0` means unlimited. |
+| `settings --upload-rate-limit <bytes-per-second>` | Set the session upload limit; `0` means unlimited. |
+| `settings --enable-dht true/false` | Enable or disable DHT peer discovery. |
 | `shutdown` | Stop this directory's worker and transfers, retaining saved state. |
 
 Use `terrence <command> --help` for command options.
+In the table, `true/false` means choose either `true` or `false`; pass only one
+of `--start` and `--no-start`. Settings flags can be combined in one command.
 
 ### Status and information
 
-`list` reports speeds in KiB/s and ETA in seconds. Unknown ETA displays as `-`
-in the table and `null` in JSON.
+`list` reports speeds in KiB/s and ETA as hours and minutes remaining, such as
+`2h 05m`. Partial minutes round up. Unknown ETA displays as `-` in the table.
+JSON output keeps ETA in seconds, or `null` when unknown.
 
 `info` includes source, hashes, save path, transfer rates and totals, piece
 information, web seeds, and peer counts. Files appear in a table with size,
@@ -155,17 +177,74 @@ retained when a magnet leaves the active session.
 
 ## Storage and background operation
 
+### Directory defaults
+
+Terrence creates `terrence.json` when a worker first starts in the current working
+directory. Help commands do not create files or start a worker.
+Edit this file or use `terrence settings` to view and update defaults:
+
+```json
+{
+  "seed_completed": false,
+  "auto_start": true,
+  "download_directory": "downloads",
+  "download_rate_limit": 0,
+  "upload_rate_limit": 0,
+  "enable_dht": true
+}
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `seed_completed` | Keep active torrents seeding after completion. Default: `false`. |
+| `auto_start` | Start newly added torrents. Default: `true`; override per add with `--start` or `--no-start`. |
+| `download_directory` | Relative subdirectory for new downloads. Default: `downloads`; must remain inside the working directory, outside `.terrence` and `.git`. |
+| `download_rate_limit` | Combined session download limit in bytes/second; `0` means unlimited. |
+| `upload_rate_limit` | Combined session upload limit in bytes/second; `0` means unlimited. |
+| `enable_dht` | Enable DHT peer discovery. Default: `true`. |
+
+```sh
+terrence settings
+terrence settings --auto-start false
+terrence settings --download-directory incoming --download-rate-limit 1048576
+terrence settings --upload-rate-limit 262144 --enable-dht true
+terrence add torrent "example.torrent" --start
+```
+
+Manual edits are loaded on the next command; CLI settings changes are saved
+and applied immediately. `terrence settings` displays effective settings, including
+defaults for omitted keys. Precedence is: explicit `add --start`/`--no-start`
+flags, then values in `terrence.json`, then built-in defaults.
+Rate limits must be integers from `0` to `2147483647`; `1048576` bytes/second is
+1 MiB/s. Boolean values in JSON must be `true` or `false`, without quotes.
+Invalid JSON, unknown keys,
+and invalid values produce an error without replacing the file. Fix the file
+and retry; `shutdown` remains available even if the file is invalid.
+
+Download-directory and auto-start defaults affect new torrents only. Existing
+torrents keep their stored paths, including when restarted or removed. Download
+and upload limits apply to the whole directory's session. Completed torrents
+are not automatically restarted when seeding is enabled.
+
+Existing settings in `.terrence/state.json` migrate into `terrence.json` when
+the new file does not exist. An existing `terrence.json` takes precedence.
+Local `terrence.json` files are ignored by Git.
+
+### Files and worker lifecycle
+
 Terrence creates these directories where you run it:
 
 ```text
 .terrence/
-  state.json      # Settings, IDs, aliases, and saved torrent state
+  state.json      # IDs, aliases, paths, and saved torrent state
   worker.log      # Background worker diagnostics
   <id>.torrent    # Imported metadata for torrent file/URL sources
 downloads/
   <id>/           # Files belonging to this torrent
+terrence.json     # User-editable defaults for this working directory
 ```
 
+`downloads/` is the default; new torrents use a different folder if configured.
 The worker also creates lock and connection files in `.terrence`. Keep this
 directory private: it contains the local worker's authentication key and torrent
 sources, which may include private tracker credentials.
@@ -209,6 +288,7 @@ pipx uninstall terrence
 ```
 
 Uninstalling keeps directory-local state and downloaded files.
+It also preserves `terrence.json`. Reinstalling does not reset directory defaults.
 
 ## Try a local download
 

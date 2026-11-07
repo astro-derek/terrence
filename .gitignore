@@ -21,6 +21,7 @@ coverage.xml
 
 # Local client state and downloaded content
 .terrence/
+terrence.json
 .torrenting/
 downloads/
 
