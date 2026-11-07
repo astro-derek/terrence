@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 def request(root, message, start=True):
-    directory = Path(root) / '.torrenting'
+    directory = Path(root) / '.terrence'
     def connect():
         endpoint = json.loads((directory / 'endpoint.json').read_text())
         with Client(('127.0.0.1', endpoint['port']), authkey=bytes.fromhex(endpoint['key'])) as connection:
@@ -36,7 +36,7 @@ def request(root, message, start=True):
     environment = os.environ.copy()
     environment['PYTHONPATH'] = str(Path(__file__).resolve().parent.parent) + os.pathsep + environment.get('PYTHONPATH', '')
     with (directory / 'worker.log').open('ab') as log:
-        process = subprocess.Popen([sys.executable, '-m', 'torrenting.worker', str(root)],
+        process = subprocess.Popen([sys.executable, '-m', 'terrence.worker', str(root)],
                                    stdout=log, stderr=log, env=environment, **options)
         threading.Thread(target=process.wait, daemon=True).start()
     for _ in range(100):

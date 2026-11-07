@@ -6,7 +6,7 @@ from pathlib import Path
 
 import libtorrent as lt
 
-from torrenting.worker import Engine
+from terrence.worker import Engine
 
 
 class ClientTests(unittest.TestCase):
@@ -78,6 +78,24 @@ class ClientTests(unittest.TestCase):
         other = Engine(self.root)
         self.assertTrue(other.state['settings']['seed_completed'])
 
+    def test_info_active_and_stopped(self):
+        self.add()
+        details = self.engine.dispatch(dict(command='info', target='example'))
+        self.assertTrue(details['live'])
+        self.assertEqual(details['total_size'], 12)
+        self.assertEqual(details['files'][0]['path'], 'example.txt')
+        self.assertIsNone(details['tracker_seeds'])
+        self.assertIsNone(details['tracker_leechers'])
+        self.assertEqual(details['connected_leechers'], 0)
+        self.engine.dispatch(dict(command='stop', target='1'))
+        details = self.engine.dispatch(dict(command='info', target='1'))
+        self.assertFalse(details['live'])
+        self.assertNotIn(1, self.engine.handles)
+        self.assertEqual(details['total_size'], 12)
+        self.assertIsNone(details['files'][0]['completed_bytes'])
+        with self.assertRaisesRegex(ValueError, 'Unknown torrent'):
+            self.engine.dispatch(dict(command='info', target='missing'))
+
     def test_completed_payload_stops_seeding(self):
         payload = b'hello world!'
         self.source.write_bytes(lt.bencode({b'info': {
@@ -97,7 +115,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.engine.state['torrents'][0]['progress'], 1)
 
     def test_background_round_trip(self):
-        from torrenting.client import request
+        from terrence.client import request
         isolated = self.root / 'background'
         isolated.mkdir()
         try:
@@ -110,7 +128,7 @@ class ClientTests(unittest.TestCase):
         finally:
             request(isolated, {'command': 'shutdown'}, start=False)
             deadline = time.monotonic() + 5
-            while (isolated / '.torrenting' / 'endpoint.json').exists() and time.monotonic() < deadline:
+            while (isolated / '.terrence' / 'endpoint.json').exists() and time.monotonic() < deadline:
                 time.sleep(.05)
 
 
