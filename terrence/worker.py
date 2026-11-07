@@ -23,7 +23,7 @@ def write_json(path, value):
 class Engine:
     def __init__(self, root):
         self.root = Path(root)
-        self.directory = self.root / '.torrenting'
+        self.directory = self.root / '.terrence'
         self.directory.mkdir(exist_ok=True)
         self.path = self.directory / 'state.json'
         self.state = json.loads(self.path.read_text()) if self.path.exists() else {
@@ -99,8 +99,57 @@ class Engine:
         with self.lock:
             return self.command(message)
 
+    def info(self, row):
+        self.tick()
+        result = dict(row)
+        handle = self.handles.get(row['id'])
+        result.update(save_path=str(self.root / 'downloads' / str(row['id'])),
+                      live=handle is not None, connected_peers=0, connected_seeds=0,
+                      connected_leechers=0, known_peers=None, known_seeds=None,
+                      tracker_seeds=None, tracker_leechers=None,
+                      total_size=None, downloaded_bytes=None, uploaded_bytes=None,
+                      files=[], trackers=[], web_seeds=[])
+        metadata = None
+        if handle is not None:
+            status = handle.status()
+            result.update(
+                engine_state=str(status.state), has_metadata=status.has_metadata,
+                connected_peers=status.num_peers, connected_seeds=status.num_seeds,
+                connected_leechers=max(0, status.num_peers - status.num_seeds),
+                known_peers=status.list_peers, known_seeds=status.list_seeds,
+                tracker_seeds=status.num_complete if status.num_complete >= 0 else None,
+                tracker_leechers=status.num_incomplete if status.num_incomplete >= 0 else None,
+                downloaded_bytes=status.all_time_download, uploaded_bytes=status.all_time_upload,
+                completed_bytes=status.total_wanted_done if status.has_metadata else None,
+                distributed_copies=status.distributed_copies,
+                current_tracker=status.current_tracker or None)
+            result['trackers'] = [dict(url=t['url'], tier=t['tier']) for t in handle.trackers()]
+            metadata = handle.torrent_file()
+        else:
+            result.update(download_rate=0, upload_rate=0, eta=None)
+            params = self.params(row)
+            metadata = params.ti
+            result['trackers'] = [dict(url=url) for url in params.trackers]
+        if metadata is not None:
+            storage = metadata.files()
+            progress = handle.file_progress() if handle is not None else None
+            result.update(name=metadata.name(), has_metadata=True,
+                          total_size=metadata.total_size(), piece_count=metadata.num_pieces(),
+                          piece_size=metadata.piece_length(), private=metadata.priv())
+            result['files'] = [dict(path=storage.file_path(i), size=storage.file_size(i),
+                                    completed_bytes=progress[i] if progress is not None else None)
+                               for i in range(storage.num_files())]
+            if not result['trackers']:
+                result['trackers'] = [dict(url=t.url, tier=t.tier) for t in metadata.trackers()]
+            result['web_seeds'] = [dict(seed) for seed in metadata.web_seeds()]
+        else:
+            result['has_metadata'] = False
+        return result
+
     def command(self, message):
         command = message['command']
+        if command == 'info':
+            return self.info(self.find(message['target']))
         if command == 'list':
             self.tick()
             rows = []
@@ -195,7 +244,7 @@ class Engine:
 
 def main():
     root = Path(sys.argv[1]).resolve()
-    directory = root / '.torrenting'
+    directory = root / '.terrence'
     directory.mkdir(exist_ok=True)
     # OS-backed file lock is released even after a crash; only one worker owns state.
     with (directory / 'worker.lock').open('a+b') as lock:

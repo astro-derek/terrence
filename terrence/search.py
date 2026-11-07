@@ -95,7 +95,7 @@ def search(query, page=1, limit=20):
     if page < 1 or not 1 <= limit <= 100:
         raise ValueError('Page must be positive and limit must be between 1 and 100')
     url = BASE_URL + '/search/?' + urlencode({'q': query, 'page': page})
-    request = Request(url, headers={'User-Agent': 'torrenting-cli/0.1.0', 'Accept': 'text/html'})
+    request = Request(url, headers={'User-Agent': 'terrence/0.1.0', 'Accept': 'text/html'})
     try:
         with urlopen(request, timeout=20) as response:
             data = response.read(MAX_PAGE_BYTES + 1)

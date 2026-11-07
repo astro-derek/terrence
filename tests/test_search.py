@@ -6,8 +6,8 @@ from email.message import Message
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from torrenting.search import SearchError, parse_results, search
-from torrenting.cli import main
+from terrence.search import SearchError, parse_results, search
+from terrence.cli import main
 
 # Representative table markup; live compatibility must also be checked against EXT.
 PAGE = '''<table><tr><th>Name</th><th>Size</th></tr><tr>
@@ -32,7 +32,7 @@ class SearchTests(unittest.TestCase):
         with self.assertRaisesRegex(SearchError, 'unrecognized'):
             parse_results('<title>Just a moment...</title>')
 
-    @patch('torrenting.search.urlopen')
+    @patch('terrence.search.urlopen')
     def test_request_encoding_and_limit(self, opener):
         response = opener.return_value.__enter__.return_value
         response.headers = Message()
@@ -42,33 +42,33 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(request.full_url, 'https://ext.to/search/?q=linux+%26+test&page=2')
         self.assertEqual(opener.call_args.kwargs['timeout'], 20)
 
-    @patch('torrenting.search.urlopen')
+    @patch('terrence.search.urlopen')
     def test_http_error(self, opener):
         opener.side_effect = HTTPError('https://ext.to', 403, 'Forbidden', {}, None)
         with self.assertRaisesRegex(SearchError, 'HTTP 403'):
             search('linux')
 
-    @patch('torrenting.search.urlopen')
+    @patch('terrence.search.urlopen')
     def test_invalid_input_does_not_request(self, opener):
         for args in [('', 1, 20), ('linux', 0, 20), ('linux', 1, 101)]:
             with self.assertRaises(ValueError):
                 search(*args)
         opener.assert_not_called()
 
-    @patch('torrenting.cli.request')
-    @patch('torrenting.cli.search')
+    @patch('terrence.cli.request')
+    @patch('terrence.cli.search')
     def test_cli_json_does_not_start_worker(self, provider, worker):
         provider.return_value = parse_results(PAGE)
         output = io.StringIO()
-        with patch('sys.argv', ['torrenting', 'search', 'example', 'linux', '--json']), contextlib.redirect_stdout(output):
+        with patch('sys.argv', ['terrence', 'search', 'example', 'linux', '--json']), contextlib.redirect_stdout(output):
             main()
         self.assertEqual(json.loads(output.getvalue()), provider.return_value)
         provider.assert_called_once_with('example linux', page=1, limit=20)
         worker.assert_not_called()
 
-    @patch('torrenting.cli.search', side_effect=SearchError('EXT unavailable'))
+    @patch('terrence.cli.search', side_effect=SearchError('EXT unavailable'))
     def test_cli_provider_failure(self, provider):
-        with patch('sys.argv', ['torrenting', 'search', 'linux']), contextlib.redirect_stderr(io.StringIO()) as output:
+        with patch('sys.argv', ['terrence', 'search', 'linux']), contextlib.redirect_stderr(io.StringIO()) as output:
             with self.assertRaises(SystemExit) as raised:
                 main()
         self.assertEqual(raised.exception.code, 1)
