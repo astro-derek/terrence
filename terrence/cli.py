@@ -1,8 +1,16 @@
 import argparse
 import json
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from .client import request
+
+
+def version_text():
+    try:
+        return f'terrence {version("terrence")}'
+    except PackageNotFoundError:
+        return 'terrence (version unavailable; package is not installed)'
 
 
 def format_eta(seconds):
@@ -35,6 +43,8 @@ def print_torrents(torrents):
         print(format_row(values))
         if torrent.get('error'):
             print(f"    Error: {torrent['error']}")
+        if torrent.get('copy_error'):
+            print(f"    Copy error: {torrent['copy_error']}")
 
 
 def print_table(headings, rows):
@@ -102,6 +112,8 @@ def main():
                'Edit terrence.json or use terrence settings to change defaults.\n'
                'Manual edits apply on the next command; explicit add flags override defaults.\n\n'
                'Run terrence <command> --help for details and more examples.')
+    parser.add_argument('--version', action='version', version=version_text(),
+                        help='Show the installed Terrence version and exit')
     commands = parser.add_subparsers(dest='command', required=True, title='commands', metavar='COMMAND')
 
     def command_help(name, summary, description, examples):
@@ -123,6 +135,8 @@ def main():
     add.add_argument('kind', choices=['torrent', 'magnet'], help='Use torrent for a file/URL, or magnet for a magnet URI')
     add.add_argument('source', help='Local .torrent path, HTTP(S) torrent URL, or complete magnet URI')
     add.add_argument('--alias', metavar='NAME', help='Optional unique nickname in this directory; cannot be purely numeric')
+    add.add_argument('--copy-to', metavar='PATH',
+                     help='Copy completed contents to this directory, overriding copy_to in terrence.json')
     starting = add.add_mutually_exclusive_group()
     starting.add_argument('--start', dest='start', action='store_true', default=None,
                           help='Start immediately, overriding auto_start in terrence.json')
@@ -157,7 +171,9 @@ def main():
                    'Resume downloading/seeding after pause. For stopped torrents, use start.'),
         'remove': ('Remove a torrent, optionally deleting downloaded files',
                    'Remove a torrent from management. Downloaded files are kept by default.\n'
-                   '--delete-files also deletes its downloaded files; active deletion is asynchronous.'),
+                   'Empty download folders are removed automatically.\n'
+                   '--delete-files deletes the whole torrent download folder, including its contents.\n'
+                   'Active folder deletion is retried in the background until file handles are released.'),
     }
     for name, (summary, description) in actions.items():
         examples = [f'{name} 1', f'{name} example']
@@ -166,7 +182,7 @@ def main():
         sub = command_help(name, summary, description, examples)
         sub.add_argument('target', help='Persistent numeric ID or alias from list')
         if name == 'remove':
-            sub.add_argument('--delete-files', action='store_true', help='Also delete downloaded files (default: keep files)')
+            sub.add_argument('--delete-files', action='store_true', help='Delete the torrent download folder and all contents (default: keep files)')
     alias = command_help('alias', 'Set or clear a torrent nickname',
                          'Assign a unique alias within this directory, or omit NAME to clear it.\n'
                          'Aliases cannot be purely numeric. The numeric ID always remains usable.',
@@ -180,6 +196,7 @@ def main():
                             'CLI changes are saved and applied immediately; manual edits load on the next command.\n'
                             'Unknown keys, invalid types, and invalid values are rejected.\n'
                             'Download directory and auto-start changes affect new torrents only.\n'
+                            'Copy destination changes apply to torrents without an explicit --copy-to.\n'
                             'Existing files are not moved. Rate limits apply to the whole session.\n'
                             'Completed torrents stop seeding by default. Enabling seeding does not\n'
                             'restart completed torrents automatically; use start on those torrents.',
@@ -195,6 +212,11 @@ def main():
                           help='Start newly added torrents automatically (default: true)')
     settings.add_argument('--download-directory', metavar='PATH',
                           help='Relative subdirectory inside the working directory, outside .terrence and .git; new torrents only (default: downloads)')
+    copying = settings.add_mutually_exclusive_group()
+    copying.add_argument('--copy-to', metavar='PATH',
+                          help='Completion copy directory for torrents without an explicit --copy-to (relative or absolute)')
+    copying.add_argument('--no-copy-to', dest='copy_to', action='store_const', const='',
+                          help='Disable the default completion copy directory')
     settings.add_argument('--download-rate-limit', type=int, metavar='BYTES_PER_SECOND',
                           help='Combined download limit, 0..2147483647 bytes/second; 0 = unlimited (default)')
     settings.add_argument('--upload-rate-limit', type=int, metavar='BYTES_PER_SECOND',
@@ -206,7 +228,13 @@ def main():
                  'The next command starts it again and restores previously active torrents.\n'
                  'Before updating Terrence, shut down workers in every directory where it is running.',
                  ['shutdown'])
+    command_help('version', 'Show the installed Terrence version',
+                 'Print the installed package version and exit without starting a worker.\n'
+                 'You can also use terrence --version.', ['version', '--version'])
     args = vars(parser.parse_args())
+    if args['command'] == 'version':
+        print(version_text())
+        return
     json_output = args.pop('json', False)
     try:
         result = request(Path.cwd(), args, start=args['command'] != 'shutdown')

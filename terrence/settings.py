@@ -6,6 +6,7 @@ DEFAULTS = {
     'seed_completed': False,
     'auto_start': True,
     'download_directory': 'downloads',
+    'copy_to': None,
     'download_rate_limit': 0,
     'upload_rate_limit': 0,
     'enable_dht': True,
@@ -19,6 +20,7 @@ def validate(values, root):
     if unknown:
         raise ValueError('Unknown settings: ' + ', '.join(sorted(unknown)))
     settings = {**DEFAULTS, **values}
+    validate_copy_to(settings['copy_to'])
     for key in ('seed_completed', 'auto_start', 'enable_dht'):
         if type(settings[key]) is not bool:
             raise ValueError(f'{key} must be true or false')
@@ -33,6 +35,12 @@ def validate(values, root):
     if Path(folder).is_absolute() or target == root or not target.is_relative_to(root) or target.is_relative_to(root / '.terrence') or target.is_relative_to(root / '.git'):
         raise ValueError('download_directory must be a subdirectory of the working directory outside .terrence and .git')
     return settings
+
+
+def validate_copy_to(value):
+    if value is not None and (not isinstance(value, str) or not value.strip()):
+        raise ValueError('copy_to must be a nonempty path or null (disabled)')
+    return value
 
 
 def read_settings(root):

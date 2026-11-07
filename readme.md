@@ -66,6 +66,7 @@ Open a new terminal and verify:
 
 ```sh
 terrence --help
+terrence version
 ```
 
 ### Install for local development
@@ -130,8 +131,9 @@ directory, and cannot be purely numeric.
 
 | Command | Behavior |
 | --- | --- |
-| `add torrent <file-or-url> [--alias <name>] [--start / --no-start]` | Add a torrent file or HTTP(S) URL using directory defaults, with an optional start override. |
-| `add magnet <uri> [--alias <name>] [--start / --no-start]` | Add a magnet link using directory defaults, with an optional start override. |
+| `version` or `--version` | Show the installed Terrence package version without starting a worker. |
+| `add torrent <file-or-url> [--alias <name>] [--start / --no-start] [--copy-to <path>]` | Add a torrent file or HTTP(S) URL, optionally overriding start and completion copy defaults. |
+| `add magnet <uri> [--alias <name>] [--start / --no-start] [--copy-to <path>]` | Add a magnet link, optionally overriding start and completion copy defaults. |
 | `list [--json]` | Show managed torrents, status, progress, speeds, and ETA. |
 | `info <target> [--json]` | Show detailed information with file and tracker tables. |
 | `pause <target>` | Pause activity while retaining the torrent in the session. |
@@ -145,6 +147,8 @@ directory, and cannot be purely numeric.
 | `settings --seed-completed false` | Stop seeding on completion (default). |
 | `settings --auto-start true/false` | Set whether new torrents start automatically. |
 | `settings --download-directory <path>` | Set the relative download folder for new torrents. |
+| `settings --copy-to <path>` | Set the completion copy directory for torrents without an explicit override. |
+| `settings --no-copy-to` | Disable the default completion copy directory. |
 | `settings --download-rate-limit <bytes-per-second>` | Set the session download limit; `0` means unlimited. |
 | `settings --upload-rate-limit <bytes-per-second>` | Set the session upload limit; `0` means unlimited. |
 | `settings --enable-dht true/false` | Enable or disable DHT peer discovery. |
@@ -188,6 +192,7 @@ Edit this file or use `terrence settings` to view and update defaults:
   "seed_completed": false,
   "auto_start": true,
   "download_directory": "downloads",
+  "copy_to": null,
   "download_rate_limit": 0,
   "upload_rate_limit": 0,
   "enable_dht": true
@@ -199,6 +204,7 @@ Edit this file or use `terrence settings` to view and update defaults:
 | `seed_completed` | Keep active torrents seeding after completion. Default: `false`. |
 | `auto_start` | Start newly added torrents. Default: `true`; override per add with `--start` or `--no-start`. |
 | `download_directory` | Relative subdirectory for new downloads. Default: `downloads`; must remain inside the working directory, outside `.terrence` and `.git`. |
+| `copy_to` | Copy completed torrent contents to this directory. Relative to the working directory, or absolute. Default: `null` (disabled); override per add with `--copy-to PATH`. |
 | `download_rate_limit` | Combined session download limit in bytes/second; `0` means unlimited. |
 | `upload_rate_limit` | Combined session upload limit in bytes/second; `0` means unlimited. |
 | `enable_dht` | Enable DHT peer discovery. Default: `true`. |
@@ -209,11 +215,14 @@ terrence settings --auto-start false
 terrence settings --download-directory incoming --download-rate-limit 1048576
 terrence settings --upload-rate-limit 262144 --enable-dht true
 terrence add torrent "example.torrent" --start
+terrence add torrent "example.torrent" --copy-to "D:/Completed"
+terrence settings --copy-to "finished"
+terrence settings --no-copy-to
 ```
 
 Manual edits are loaded on the next command; CLI settings changes are saved
 and applied immediately. `terrence settings` displays effective settings, including
-defaults for omitted keys. Precedence is: explicit `add --start`/`--no-start`
+defaults for omitted keys. Precedence is: explicit `add --start`/`--no-start`/`--copy-to`
 flags, then values in `terrence.json`, then built-in defaults.
 Rate limits must be integers from `0` to `2147483647`; `1048576` bytes/second is
 1 MiB/s. Boolean values in JSON must be `true` or `false`, without quotes.
@@ -225,6 +234,19 @@ Download-directory and auto-start defaults affect new torrents only. Existing
 torrents keep their stored paths, including when restarted or removed. Download
 and upload limits apply to the whole directory's session. Completed torrents
 are not automatically restarted when seeding is enabled.
+
+An explicit `add --copy-to` destination is saved for that torrent. Otherwise,
+Terrence uses the current `copy_to` setting on completion, including for existing
+in-progress torrents. Manual settings edits apply on the next command.
+On completion, Terrence copies the torrent's files and directory
+layout directly into that destination, retaining the originals for seeding. Copies
+also run when `seed_completed` is enabled, and a successful copy is recorded so it
+is not repeated on restart. Matching destination files are overwritten. Use distinct
+destinations for torrents with conflicting filenames. Destinations must not overlap
+the torrent's download directory or be inside `.terrence` or `.git`.
+Copy failures appear as `copy_error` in torrent details (and in `list`) and are
+retried by the worker while the torrent remains attached. Stopping a torrent also
+stops retries until it is started again.
 
 Existing settings in `.terrence/state.json` migrate into `terrence.json` when
 the new file does not exist. An existing `terrence.json` takes precedence.
@@ -256,13 +278,26 @@ automatically at login or after a reboot.
 
 Completed torrents stop seeding by default. Changing `--seed-completed` does not
 restart torrents already marked completed; use `start` to restart those.
-File deletion for active torrents is asynchronous.
+`remove` deletes an empty torrent download folder but retains nonempty folders
+and their files. `remove --delete-files` deletes the torrent's entire numeric
+download folder and all its contents. Active folder deletion runs in the
+background and retries while files are locked; pending cleanup survives worker
+restarts. The parent download directory and separate completion copies are kept.
 
 Fast-resume snapshots are not implemented: existing pieces are checked when a
 torrent is reattached or a worker restarts. Magnet metadata may need fetching
 again. Torrent search is not included.
 
 ## Updating and uninstalling
+
+Completion copies and pending folder cleanup run in file-worker threads so
+`list` and `info` do not wait for those operations to finish. While a completion
+copy is pending, `stop` and `remove` ask you to retry after it finishes, keeping
+the source files available to the copy. Connection setup times out after five
+seconds if the background worker cannot complete its handshake; commands are
+not automatically replayed after a timeout. Command responses have a separate
+30-second timeout. Initial worker startup, torrent URL fetching, and disk checks
+can still take time.
 
 First run `terrence shutdown` in **each directory** with an active worker. Avoid
 other Terrence commands until the update finishes, since they can restart workers.

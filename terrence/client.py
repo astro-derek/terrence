@@ -4,8 +4,34 @@ import subprocess
 import sys
 import time
 import threading
-from multiprocessing.connection import Client
+import socket
+from multiprocessing.connection import Connection, answer_challenge, deliver_challenge
 from pathlib import Path
+
+
+def connect_worker(address, key, timeout=5):
+    deadline = time.monotonic() + timeout
+    with socket.create_connection(address, timeout=timeout) as sock:
+        sock.setblocking(True)
+        connection = Connection(sock.detach())
+
+    class Handshake:
+        def send_bytes(self, data):
+            connection.send_bytes(data)
+
+        def recv_bytes(self, maxlength=None):
+            if not connection.poll(max(0, deadline - time.monotonic())):
+                raise TimeoutError('Background worker is busy or unresponsive during connection setup; retry shortly')
+            return connection.recv_bytes(maxlength)
+
+    try:
+        handshake = Handshake()
+        answer_challenge(handshake, key)
+        deliver_challenge(handshake, key)
+        return connection
+    except BaseException:
+        connection.close()
+        raise
 
 
 def request(root, message, start=True):
@@ -15,7 +41,7 @@ def request(root, message, start=True):
     directory = Path(root) / '.terrence'
     def connect():
         endpoint = json.loads((directory / 'endpoint.json').read_text())
-        with Client(('127.0.0.1', endpoint['port']), authkey=bytes.fromhex(endpoint['key'])) as connection:
+        with connect_worker(('127.0.0.1', endpoint['port']), bytes.fromhex(endpoint['key'])) as connection:
             connection.send_bytes(json.dumps(message).encode())
             if not connection.poll(30):
                 raise TimeoutError('Background client did not respond within 30 seconds')
@@ -25,6 +51,8 @@ def request(root, message, start=True):
         return reply['result']
     try:
         return connect()
+    except TimeoutError:
+        raise  # Never spawn another worker or replay a command after an ambiguous timeout.
     except (OSError, EOFError, json.JSONDecodeError):
         if not start:
             raise ValueError('No background client is running in this directory')
@@ -46,6 +74,8 @@ def request(root, message, start=True):
         time.sleep(.1)
         try:
             return connect()
+        except TimeoutError:
+            raise
         except (OSError, EOFError, json.JSONDecodeError):
             pass
     raise ValueError(f'Could not start client; see {directory / "worker.log"}')

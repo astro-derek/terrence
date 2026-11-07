@@ -3,6 +3,7 @@ import unittest
 import hashlib
 import time
 import json
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 import libtorrent as lt
@@ -20,6 +21,7 @@ class ClientTests(unittest.TestCase):
         self.engine = Engine(self.root)
 
     def tearDown(self):
+        self.engine.io_pool.shutdown(wait=True)
         self.engine.session.pause()
         self.engine.handles.clear()
         del self.engine
@@ -53,6 +55,28 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'numeric'):
             self.engine.dispatch(dict(command='alias', target='1', name='2'))
 
+    def test_magnet_metadata_survives_restart(self):
+        metadata = lt.torrent_info(str(self.source))
+        row = self.engine.dispatch(dict(command='add', kind='magnet',
+                                        source=lt.make_magnet_uri(metadata)))
+        handle = self.engine.handles[row['id']]
+        handle.set_metadata(metadata.metadata())
+        deadline = time.monotonic() + 5
+        cached = self.engine.directory / f"{row['id']}.torrent"
+        while not cached.exists() and time.monotonic() < deadline:
+            self.engine.tick()
+            time.sleep(.05)
+        self.assertTrue(cached.exists())
+        self.assertEqual(lt.torrent_info(str(cached)).info_hashes(), metadata.info_hashes())
+        self.engine.dispatch(dict(command='stop', target=str(row['id'])))
+        other = Engine(self.root)
+        restored = other.state['torrents'][0]
+        self.assertIsNotNone(other.params(restored).ti)
+        other.dispatch(dict(command='start', target=str(row['id'])))
+        self.assertTrue(other.handles[row['id']].status().has_metadata)
+        other.session.pause()
+        other.handles.clear()
+
     def test_remove_keeps_files_and_ids_are_not_reused(self):
         self.add()
         self.engine.dispatch(dict(command='stop', target='1'))
@@ -71,6 +95,29 @@ class ClientTests(unittest.TestCase):
         folder.mkdir(exist_ok=True)
         (folder / 'remove.txt').write_text('remove')
         self.engine.dispatch(dict(command='remove', target='1', delete_files=True))
+        self.assertFalse(folder.exists())
+
+    def test_remove_active_deletes_containing_folder(self):
+        self.add()
+        folder = self.root / 'downloads' / '1'
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / 'extra.txt').write_text('test')
+        self.engine.dispatch(dict(command='remove', target='1', delete_files=True))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            self.engine.tick()
+            if not folder.exists() and not self.engine.state.get('pending_folder_cleanup'):
+                break
+            time.sleep(.05)
+        self.assertFalse(folder.exists())
+        self.assertFalse(self.engine.state.get('pending_folder_cleanup'))
+
+    def test_remove_empty_folder_without_deleting_files(self):
+        self.add()
+        self.engine.dispatch(dict(command='stop', target='1'))
+        folder = self.root / 'downloads' / '1'
+        folder.mkdir(parents=True, exist_ok=True)
+        self.engine.dispatch(dict(command='remove', target='1'))
         self.assertFalse(folder.exists())
 
     def test_settings_persist(self):
@@ -136,6 +183,49 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(json.loads((isolated / 'terrence.json').read_text())['seed_completed'])
         self.assertNotIn('settings', other.state)
 
+    def test_copy_destination_defaults_override_and_persistence(self):
+        self.engine.dispatch(dict(command='settings', copy_to='finished', auto_start='false'))
+        row = self.engine.dispatch(dict(command='add', kind='torrent', source=str(self.source),
+                                        copy_to=str(self.root / 'override')))
+        self.assertEqual(row['copy_to'], str(self.root / 'override'))
+        self.engine.dispatch(dict(command='settings', copy_to='changed'))
+        other = Engine(self.root)
+        self.assertEqual(other.state['torrents'][0]['copy_to'], row['copy_to'])
+        self.assertEqual(other.settings['copy_to'], 'changed')
+        self.engine.dispatch(dict(command='remove', target='1'))
+        self.assertIsNone(self.add()['copy_to'])
+        self.engine.dispatch(dict(command='settings', copy_to=''))
+        self.assertIsNone(self.engine.settings['copy_to'])
+
+    def test_copy_validation(self):
+        for value in ('', ' ', 123, False):
+            with self.assertRaises(ValueError):
+                self.engine.dispatch(dict(command='add', kind='torrent', source=str(self.source), copy_to=value))
+        for value in ('downloads/1', 'downloads', '.terrence/copies', '.git/copies'):
+            with self.assertRaises(ValueError):
+                self.engine.dispatch(dict(command='add', kind='torrent', source=str(self.source), copy_to=value))
+        with self.assertRaises(ValueError):
+            self.engine.dispatch(dict(command='settings', copy_to=123))
+
+    def test_copy_failure_does_not_interrupt_completion_and_retries(self):
+        row = self.add()
+        row['copy_to'] = str(self.root / 'finished')
+        handle = Mock()
+        handle.status.return_value = Mock(name='example', progress=1, download_rate=0,
+                                          upload_rate=0, is_seeding=True)
+        handle.status.return_value.name = 'example'
+        handle.status.return_value.errc.value.return_value = 0
+        self.engine.handles[row['id']] = handle
+        with patch.object(self.engine, 'copy_completed', side_effect=OSError('destination unavailable')):
+            self.engine.tick()
+        self.assertEqual(row['status'], 'completed')
+        self.assertEqual(row['copy_error'], 'destination unavailable')
+        with patch.object(self.engine, 'copy_completed') as copy:
+            self.engine.tick()
+            copy.assert_called_once()
+            self.assertEqual(copy.call_args.args[0]['id'], row['id'])
+            self.assertIs(copy.call_args.args[1], handle)
+
     def test_info_active_and_stopped(self):
         self.add()
         details = self.engine.dispatch(dict(command='info', target='example'))
@@ -154,7 +244,64 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unknown torrent'):
             self.engine.dispatch(dict(command='info', target='missing'))
 
+    def test_list_stays_responsive_during_completion_copy(self):
+        import threading
+        row = self.add()
+        row['copy_to'] = str(self.root / 'finished')
+        handle = Mock()
+        handle.status.return_value = Mock(progress=1, download_rate=0, upload_rate=0, is_seeding=True)
+        handle.status.return_value.name = 'example'
+        handle.status.return_value.errc.value.return_value = 0
+        self.engine.handles[row['id']] = handle
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_copy(snapshot, handle):
+            entered.set()
+            release.wait(5)
+            snapshot['copied_to'] = snapshot['copy_to']
+
+        with patch.object(self.engine, 'copy_completed', side_effect=slow_copy):
+            try:
+                self.engine.dispatch({'command': 'list'})
+                self.assertTrue(entered.wait(1))
+                started = time.monotonic()
+                self.assertEqual(len(self.engine.dispatch({'command': 'list'})), 1)
+                self.assertLess(time.monotonic() - started, 1)
+            finally:
+                release.set()
+                self.engine.io_jobs[('copy', row['id'])].result(timeout=2)
+            self.engine.tick(background=True)
+            self.assertEqual(row['copied_to'], row['copy_to'])
+
+    def test_connection_handshake_times_out(self):
+        import socket
+        import threading
+        from terrence.client import connect_worker
+        release = threading.Event()
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+
+            def stalled_worker():
+                with listener.accept()[0]:
+                    release.wait(2)
+
+            thread = threading.Thread(target=stalled_worker)
+            thread.start()
+            try:
+                with self.assertRaises(TimeoutError):
+                    connect_worker(listener.getsockname(), b'test', timeout=.1)
+            finally:
+                release.set()
+                thread.join(2)
+
     def test_completed_payload_stops_seeding(self):
+        self.check_completion_copy(seed=False)
+
+    def test_completion_copies_while_seeding(self):
+        self.check_completion_copy(seed=True)
+
+    def check_completion_copy(self, seed):
         payload = b'hello world!'
         self.source.write_bytes(lt.bencode({b'info': {
             b'name': b'example.txt', b'length': len(payload), b'piece length': 16384,
@@ -162,15 +309,25 @@ class ClientTests(unittest.TestCase):
         folder = self.root / 'downloads' / '1'
         folder.mkdir()
         (folder / 'example.txt').write_bytes(payload)
-        self.add()
+        row = self.add()
+        # Older in-progress torrents have no copy_to field at all.
+        if not seed:
+            row.pop('copy_to')
+        self.engine.dispatch(dict(command='settings', copy_to='finished', seed_completed=seed))
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             self.engine.tick()
-            if self.engine.state['torrents'][0]['status'] == 'completed':
+            if row.get('copied_to'):
                 break
             time.sleep(.05)
-        self.assertEqual(self.engine.state['torrents'][0]['status'], 'completed')
+        self.assertEqual(row['status'], 'running' if seed else 'completed')
         self.assertEqual(self.engine.state['torrents'][0]['progress'], 1)
+        self.assertEqual((self.root / 'finished' / 'example.txt').read_bytes(), payload)
+        self.assertEqual((folder / 'example.txt').read_bytes(), payload)
+        self.assertEqual(row['copied_to'], str(self.root / 'finished'))
+        with patch.object(self.engine, 'copy_completed') as copy:
+            self.engine.tick()
+            copy.assert_not_called()
 
     def test_background_round_trip(self):
         from terrence.client import request

@@ -6,13 +6,14 @@ import shutil
 import socket
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.connection import Listener
 from multiprocessing import AuthenticationError
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import libtorrent as lt
-from .settings import DEFAULTS, read_settings, validate
+from .settings import DEFAULTS, read_settings, validate, validate_copy_to
 
 
 def write_json(path, value):
@@ -37,6 +38,8 @@ class Engine:
         self.session = lt.session({'listen_interfaces': '0.0.0.0:0', 'enable_dht': True})
         self.apply_settings()
         self.handles = {}
+        self.io_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='terrence-files')
+        self.io_jobs = {}
         self.lock = threading.RLock()
         self.running = True
         (self.root / self.settings['download_directory']).mkdir(parents=True, exist_ok=True)
@@ -62,6 +65,9 @@ class Engine:
     def params(self, row):
         if row['kind'] == 'magnet':
             params = lt.parse_magnet_uri(row['source'])
+            cached = self.directory / f"{row['id']}.torrent"
+            if cached.exists():
+                params.ti = lt.torrent_info(str(cached))
         else:
             params = lt.add_torrent_params()
             params.ti = lt.torrent_info(str(self.directory / f"{row['id']}.torrent"))
@@ -90,19 +96,114 @@ class Engine:
             if any(r['alias'] == name and r['id'] != current for r in self.state['torrents']):
                 raise ValueError('Alias is already in use')
 
-    def tick(self):
+    def copy_destination(self, value, source):
+        validate_copy_to(value)
+        if value is None:
+            return None
+        target = (self.root / value).resolve()
+        source = Path(source).resolve()
+        if target.is_relative_to(source) or source.is_relative_to(target):
+            raise ValueError('copy_to must not overlap the torrent download directory')
+        if any(target.is_relative_to(self.root.resolve() / name) for name in ('.terrence', '.git')):
+            raise ValueError('copy_to must be outside .terrence and .git')
+        return str(target)
+
+    def copy_completed(self, row, handle):
+        target = self.copy_destination(row.get('copy_to') or self.settings['copy_to'],
+                                       self.download_path(row))
+        source = self.download_path(row).resolve()
+        storage = handle.torrent_file().files()
+        # Copy only torrent files, preserving the torrent's own directory layout.
+        for index in range(storage.num_files()):
+            if storage.file_flags(index) & lt.file_storage.flag_pad_file:
+                continue
+            relative = Path(storage.file_path(index))
+            original = (source / relative).resolve()
+            destination = (Path(target) / relative).resolve()
+            if not original.is_relative_to(source) or not destination.is_relative_to(Path(target)):
+                raise ValueError('Torrent file path escapes the copy or download directory')
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(original, destination)
+        row['copied_to'] = target
+        row.pop('copy_error', None)
+
+    def file_job(self, key, operation, background):
+        if not background:
+            return True, operation()
+        future = self.io_jobs.get(key)
+        if future is None:
+            self.io_jobs[key] = self.io_pool.submit(operation)
+            return False, None
+        if not future.done():
+            return False, None
+        del self.io_jobs[key]
+        return True, future.result()
+
+    def cleanup_folder(self, folder):
+        path = Path(folder)
+        self.validate_removal_path(path)
+        if path.exists():
+            shutil.rmtree(path)
+
+    def copy_snapshot(self, row, handle):
+        self.copy_completed(row, handle)
+        return row
+
+    def tick(self, background=False):
         changed = False
+        for folder in list(self.state.get('pending_folder_cleanup', [])):
+            try:
+                done, _ = self.file_job(('delete', folder),
+                                        lambda folder=folder: self.cleanup_folder(folder), background)
+                if not done:
+                    continue
+            except (OSError, ValueError):
+                continue
+            self.state['pending_folder_cleanup'].remove(folder)
+            changed = True
         for row in self.state['torrents']:
             handle = self.handles.get(row['id'])
             if handle is None:
                 continue
             status = handle.status()
+            if row['kind'] == 'magnet' and status.has_metadata:
+                cached = self.directory / f"{row['id']}.torrent"
+                if not cached.exists():
+                    try:
+                        metadata = handle.torrent_file()
+                        data = lt.bencode(lt.create_torrent(metadata).generate())
+                        temporary = cached.with_suffix('.torrent.tmp')
+                        temporary.write_bytes(data)
+                        temporary.replace(cached)
+                        row.pop('metadata_cache_error', None)
+                    except (OSError, RuntimeError) as error:
+                        row['metadata_cache_error'] = str(error)
+                    changed = True
             row.update(name=status.name, progress=status.progress,
                        download_rate=status.download_rate, upload_rate=status.upload_rate,
                        eta=round(max(0, status.total_wanted-status.total_wanted_done)/status.download_rate)
                        if status.download_rate else None)
             if status.errc.value():
                 row['error'] = status.errc.message()
+            if (('copy', row['id']) in self.io_jobs or
+                    (status.is_seeding and (row.get('copy_to') or self.settings['copy_to'])
+                     and not row.get('copied_to'))):
+                try:
+                    snapshot = dict(row)
+                    # Resolve the default now; file threads do not read mutable settings.
+                    snapshot['copy_to'] = row.get('copy_to') or self.settings['copy_to']
+                    done, copied = self.file_job(('copy', row['id']),
+                                                lambda snapshot=snapshot, handle=handle:
+                                                self.copy_snapshot(snapshot, handle), background)
+                    if done:
+                        if copied.get('copied_to'):
+                            row['copied_to'] = copied['copied_to']
+                        row.pop('copy_error', None)
+                        changed = True
+                except (OSError, ValueError) as error:
+                    if row.get('copy_error') != str(error):
+                        row['copy_error'] = str(error)
+                        changed = True
             if status.is_seeding and row['status'] == 'running' and not self.settings['seed_completed']:
                 handle.pause()
                 row['status'] = 'completed'
@@ -110,6 +211,15 @@ class Engine:
         self.session.pop_alerts()
         if changed:
             self.save()
+
+    def validate_removal_path(self, folder):
+        root = self.root.resolve()
+        resolved = folder.resolve()
+        if (folder.is_symlink() or not resolved.is_relative_to(root)
+                or resolved == root or resolved.is_relative_to(root / '.terrence')
+                or resolved.is_relative_to(root / '.git')
+                or not folder.name.isdecimal()):
+            raise ValueError('Refusing to remove an unsafe torrent download directory')
 
     def dispatch(self, message):
         with self.lock:
@@ -119,7 +229,7 @@ class Engine:
             return self.command(message)
 
     def info(self, row):
-        self.tick()
+        self.tick(background=True)
         result = dict(row)
         handle = self.handles.get(row['id'])
         result.update(save_path=str(self.download_path(row)),
@@ -170,7 +280,7 @@ class Engine:
         if command == 'info':
             return self.info(self.find(message['target']))
         if command == 'list':
-            self.tick()
+            self.tick(background=True)
             rows = []
             for row in self.state['torrents']:
                 item = dict(row)
@@ -187,6 +297,8 @@ class Engine:
             return 'Background client stopped'
         if command == 'settings':
             updates = {key: message[key] for key in DEFAULTS if message.get(key) is not None}
+            if updates.get('copy_to') == '':
+                updates['copy_to'] = None
             for key in ('seed_completed', 'auto_start', 'enable_dht'):
                 if key in updates and isinstance(updates[key], str):
                     if updates[key] not in ('true', 'false'):
@@ -208,6 +320,9 @@ class Engine:
             row = dict(id=number, alias=message.get('alias'), kind=message['kind'], source=source,
                        status='running' if auto_start else 'stopped',
                        save_path=str((self.root / self.settings['download_directory'] / str(number)).resolve()))
+            row['copy_to'] = self.copy_destination(
+                message.get('copy_to'),
+                row['save_path'])
             if row['kind'] == 'torrent':
                 if urlparse(source).scheme in ('http', 'https'):
                     with urlopen(source, timeout=15) as response:
@@ -238,19 +353,29 @@ class Engine:
             self.validate_alias(message.get('name'), number)
             row['alias'] = message.get('name')
         elif command == 'remove':
-            if message.get('delete_files'):
-                # Dedicated numeric directories prevent deleting another torrent's data.
-                folder = self.download_path(row)
-                if folder.is_symlink() or not folder.resolve().is_relative_to(self.root.resolve()):
-                    raise ValueError('Download path is outside the workspace')
+            job = self.io_jobs.get(('copy', number))
+            if job is not None:
+                raise ValueError('Completion copy is still pending; retry remove after it finishes')
+            folder = self.download_path(row)
+            self.validate_removal_path(folder)
             if number in self.handles:
                 handle = self.handles.pop(number)
                 self.session.remove_torrent(handle, lt.options_t.delete_files if message.get('delete_files') else 0)
+                if message.get('delete_files'):
+                    # Retry after libtorrent releases Windows file handles; survive worker restarts.
+                    self.state.setdefault('pending_folder_cleanup', []).append(str(folder))
             elif message.get('delete_files') and folder.exists():
                 shutil.rmtree(folder)
+            if not message.get('delete_files'):
+                try:
+                    folder.rmdir()
+                except OSError:
+                    pass  # Keep nonempty folders because their files were not requested for deletion.
             self.state['torrents'].remove(row)
             (self.directory / f'{number}.torrent').unlink(missing_ok=True)
         elif command == 'stop':
+            if ('copy', number) in self.io_jobs:
+                raise ValueError('Completion copy is still pending; retry stop after it finishes')
             if number in self.handles:
                 self.session.remove_torrent(self.handles.pop(number))
             row['status'] = 'stopped'
@@ -307,7 +432,7 @@ def main():
                         connection = listener.accept()
                     except (socket.timeout, AuthenticationError, EOFError, OSError):
                         with engine.lock:
-                            engine.tick()
+                            engine.tick(background=True)
                         continue
                     with connection:
                         try:
@@ -317,7 +442,10 @@ def main():
                             reply = {'result': result}
                         except Exception as error:
                             reply = {'error': str(error)}
-                        connection.send_bytes(json.dumps(reply).encode())
+                        try:
+                            connection.send_bytes(json.dumps(reply).encode())
+                        except (OSError, EOFError):
+                            pass  # A timed-out/disconnected CLI must not terminate the worker.
             finally:
                 engine.save()
                 endpoint.unlink(missing_ok=True)
