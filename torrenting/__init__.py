@@ -1,0 +1,1 @@
+"""Directory-local BitTorrent client."""

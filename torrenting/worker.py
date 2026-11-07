@@ -1,0 +1,246 @@
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import socket
+import sys
+import threading
+from multiprocessing.connection import Listener
+from multiprocessing import AuthenticationError
+from urllib.parse import urlparse
+from urllib.request import urlopen
+
+import libtorrent as lt
+
+
+def write_json(path, value):
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(value, indent=2), encoding='utf-8')
+    temporary.replace(path)
+
+
+class Engine:
+    def __init__(self, root):
+        self.root = Path(root)
+        self.directory = self.root / '.torrenting'
+        self.directory.mkdir(exist_ok=True)
+        self.path = self.directory / 'state.json'
+        self.state = json.loads(self.path.read_text()) if self.path.exists() else {
+            'next_id': 1, 'settings': {'seed_completed': False}, 'torrents': []}
+        self.session = lt.session({'listen_interfaces': '0.0.0.0:0', 'enable_dht': True})
+        self.handles = {}
+        self.lock = threading.RLock()
+        self.running = True
+        (self.root / 'downloads').mkdir(exist_ok=True)
+        for row in self.state['torrents']:
+            if row['status'] != 'stopped':
+                try:
+                    self.attach(row)
+                except Exception as error:
+                    row['error'] = str(error)
+
+    def save(self):
+        write_json(self.path, self.state)
+
+    def params(self, row):
+        if row['kind'] == 'magnet':
+            params = lt.parse_magnet_uri(row['source'])
+        else:
+            params = lt.add_torrent_params()
+            params.ti = lt.torrent_info(str(self.directory / f"{row['id']}.torrent"))
+        params.save_path = str(self.root / 'downloads' / str(row['id']))
+        params.flags &= ~lt.torrent_flags.auto_managed
+        params.flags &= ~lt.torrent_flags.paused
+        return params
+
+    def attach(self, row):
+        handle = self.session.add_torrent(self.params(row))
+        self.handles[row['id']] = handle
+        if row['status'] in ('paused', 'completed'):
+            handle.pause()
+        row.pop('error', None)
+
+    def find(self, target):
+        for row in self.state['torrents']:
+            if str(row['id']) == target or row['alias'] == target:
+                return row
+        raise ValueError(f'Unknown torrent: {target}')
+
+    def validate_alias(self, name, current=None):
+        if name is not None:
+            if not name.strip() or name.isdecimal():
+                raise ValueError('Alias must be nonempty and cannot be numeric')
+            if any(r['alias'] == name and r['id'] != current for r in self.state['torrents']):
+                raise ValueError('Alias is already in use')
+
+    def tick(self):
+        changed = False
+        for row in self.state['torrents']:
+            handle = self.handles.get(row['id'])
+            if handle is None:
+                continue
+            status = handle.status()
+            row.update(name=status.name, progress=status.progress,
+                       download_rate=status.download_rate, upload_rate=status.upload_rate,
+                       eta=round(max(0, status.total_wanted-status.total_wanted_done)/status.download_rate)
+                       if status.download_rate else None)
+            if status.errc.value():
+                row['error'] = status.errc.message()
+            if status.is_seeding and row['status'] == 'running' and not self.state['settings']['seed_completed']:
+                handle.pause()
+                row['status'] = 'completed'
+                changed = True
+        self.session.pop_alerts()
+        if changed:
+            self.save()
+
+    def dispatch(self, message):
+        with self.lock:
+            return self.command(message)
+
+    def command(self, message):
+        command = message['command']
+        if command == 'list':
+            self.tick()
+            rows = []
+            for row in self.state['torrents']:
+                item = dict(row)
+                if row['id'] in self.handles and row['status'] == 'running':
+                    status = self.handles[row['id']].status()
+                    item['status'] = 'seeding' if status.is_seeding else str(status.state)
+                if row['status'] in ('stopped', 'paused', 'completed'):
+                    item.update(download_rate=0, upload_rate=0, eta=None)
+                rows.append(item)
+            return rows
+        if command == 'shutdown':
+            self.save()
+            self.running = False
+            return 'Background client stopped'
+        if command == 'settings':
+            value = message.get('seed_completed')
+            if value is not None:
+                self.state['settings']['seed_completed'] = value == 'true'
+                self.save()
+            return self.state['settings']
+        if command == 'add':
+            self.validate_alias(message.get('alias'))
+            number = self.state['next_id']
+            source = message['source']
+            row = dict(id=number, alias=message.get('alias'), kind=message['kind'], source=source, status='running')
+            if row['kind'] == 'torrent':
+                if urlparse(source).scheme in ('http', 'https'):
+                    with urlopen(source, timeout=15) as response:
+                        data = response.read(16 * 1024 * 1024 + 1)
+                    if len(data) > 16 * 1024 * 1024:
+                        raise ValueError('Torrent metadata exceeds 16 MiB')
+                else:
+                    data = Path(source).read_bytes()
+                lt.torrent_info(lt.bdecode(data))
+                (self.directory / f'{number}.torrent').write_bytes(data)
+            params = self.params(row)
+            hashes = params.ti.info_hashes() if params.ti else params.info_hashes
+            fingerprint = [str(hashes.v1), str(hashes.v2)]
+            if any(r.get('fingerprint') == fingerprint for r in self.state['torrents']):
+                if row['kind'] == 'torrent':
+                    (self.directory / f'{number}.torrent').unlink(missing_ok=True)
+                raise ValueError('Torrent is already managed')
+            row['fingerprint'] = fingerprint
+            self.attach(row)
+            self.state['torrents'].append(row)
+            self.state['next_id'] += 1
+            self.save()
+            return row
+        row = self.find(message['target'])
+        number = row['id']
+        if command == 'alias':
+            self.validate_alias(message.get('name'), number)
+            row['alias'] = message.get('name')
+        elif command == 'remove':
+            if message.get('delete_files'):
+                # Dedicated numeric directories prevent deleting another torrent's data.
+                folder = self.root / 'downloads' / str(number)
+                if folder.is_symlink() or not folder.resolve().is_relative_to(self.root.resolve()):
+                    raise ValueError('Download path is outside the workspace')
+            if number in self.handles:
+                handle = self.handles.pop(number)
+                self.session.remove_torrent(handle, lt.options_t.delete_files if message.get('delete_files') else 0)
+            elif message.get('delete_files') and folder.exists():
+                shutil.rmtree(folder)
+            self.state['torrents'].remove(row)
+            (self.directory / f'{number}.torrent').unlink(missing_ok=True)
+        elif command == 'stop':
+            if number in self.handles:
+                self.session.remove_torrent(self.handles.pop(number))
+            row['status'] = 'stopped'
+        elif command == 'pause':
+            if number not in self.handles:
+                raise ValueError('Start the stopped torrent before pausing it')
+            self.handles[number].pause()
+            row['status'] = 'paused'
+        elif command in ('start', 'resume'):
+            if command == 'resume' and row['status'] != 'paused':
+                raise ValueError('Only paused torrents can be resumed; use start')
+            if number not in self.handles:
+                row['status'] = 'running'
+                self.attach(row)
+            else:
+                self.handles[number].resume()
+            row['status'] = 'running'
+        else:
+            raise ValueError('Unknown command')
+        self.save()
+        return row
+
+
+def main():
+    root = Path(sys.argv[1]).resolve()
+    directory = root / '.torrenting'
+    directory.mkdir(exist_ok=True)
+    # OS-backed file lock is released even after a crash; only one worker owns state.
+    with (directory / 'worker.lock').open('a+b') as lock:
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                lock.write(b'0')
+                lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        engine = Engine(root)
+        key = secrets.token_bytes(32)
+        with Listener(('127.0.0.1', 0), authkey=key) as listener:
+            endpoint = directory / 'endpoint.json'
+            write_json(endpoint, {'port': listener.address[1], 'key': key.hex()})
+            if os.name != 'nt':
+                endpoint.chmod(0o600)
+            # A timeout lets completion handling run even when no CLI is connected.
+            listener._listener._socket.settimeout(.5)
+            try:
+                while engine.running:
+                    try:
+                        connection = listener.accept()
+                    except (socket.timeout, AuthenticationError, EOFError, OSError):
+                        with engine.lock:
+                            engine.tick()
+                        continue
+                    with connection:
+                        try:
+                            if not connection.poll(5):
+                                continue
+                            result = engine.dispatch(json.loads(connection.recv_bytes(1024 * 1024)))
+                            reply = {'result': result}
+                        except Exception as error:
+                            reply = {'error': str(error)}
+                        connection.send_bytes(json.dumps(reply).encode())
+            finally:
+                engine.save()
+                endpoint.unlink(missing_ok=True)
+
+
+if __name__ == '__main__':
+    main()
