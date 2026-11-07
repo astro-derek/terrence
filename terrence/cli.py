@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 
 from .client import request
-from .search import search
 
 
 def print_torrents(torrents):
@@ -75,11 +74,6 @@ def print_info(result):
 def main():
     parser = argparse.ArgumentParser(description='Manage torrents in the current directory')
     commands = parser.add_subparsers(dest='command', required=True)
-    searching = commands.add_parser('search', help='Search EXT without adding downloads')
-    searching.add_argument('query', nargs='+', help='Search words')
-    searching.add_argument('--page', type=int, default=1)
-    searching.add_argument('--limit', type=int, default=20)
-    searching.add_argument('--json', action='store_true')
     add = commands.add_parser('add')
     add.add_argument('kind', choices=['torrent', 'magnet'])
     add.add_argument('source', help='Torrent file/HTTP(S) URL, or magnet URI')
@@ -103,18 +97,6 @@ def main():
     args = vars(parser.parse_args())
     json_output = args.pop('json', False)
     try:
-        if args['command'] == 'search':
-            rows = search(' '.join(args['query']), page=args['page'], limit=args['limit'])
-            if json_output:
-                print(json.dumps(rows, indent=2))
-            elif not rows:
-                print('No results found.')
-            else:
-                for number, row in enumerate(rows, 1):
-                    print(f"{number}. {row['title']}")
-                    print(f"   Size: {row['size'] or '?'}  Seeders: {row['seeders'] if row['seeders'] is not None else '?'}  Leechers: {row['leechers'] if row['leechers'] is not None else '?'}")
-                    print(f"   {row['url']}")
-            return
         result = request(Path.cwd(), args, start=args['command'] != 'shutdown')
         if args['command'] == 'list' and not json_output:
             print_torrents(result)
