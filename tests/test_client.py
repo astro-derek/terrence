@@ -77,6 +77,77 @@ class ClientTests(unittest.TestCase):
         other.session.pause()
         other.handles.clear()
 
+    def test_hybrid_duplicates_match_either_hash_in_both_orders(self):
+        (self.root / 'payload').write_bytes(b'hello')
+        storage = lt.file_storage()
+        storage.add_file('payload', 5)
+        torrent = lt.create_torrent(storage)
+        lt.set_piece_hashes(torrent, str(self.root))
+        self.source.write_bytes(lt.bencode(torrent.generate()))
+        hashes = lt.torrent_info(str(self.source)).info_hashes()
+        self.assertTrue(hashes.has_v1() and hashes.has_v2())
+        magnets = ['magnet:?xt=urn:btih:' + str(hashes.v1),
+                   'magnet:?xt=urn:btmh:1220' + str(hashes.v2)]
+        for magnet in magnets:
+            for magnet_first in (False, True):
+                with self.subTest(magnet=magnet, magnet_first=magnet_first):
+                    file_add = dict(command='add', kind='torrent', source=str(self.source))
+                    magnet_add = dict(command='add', kind='magnet', source=magnet)
+                    first, second = (magnet_add, file_add) if magnet_first else (file_add, magnet_add)
+                    row = self.engine.dispatch(first)
+                    with self.assertRaisesRegex(ValueError, 'already managed'):
+                        self.engine.dispatch(second)
+                    self.assertEqual(len(self.engine.state['torrents']), 1)
+                    self.assertTrue(self.engine.handles[row['id']].is_valid())
+                    self.engine.dispatch(dict(command='stop', target=str(row['id'])))
+                    with self.assertRaisesRegex(ValueError, 'already managed'):
+                        self.engine.dispatch(second)
+                    self.engine.dispatch(dict(command='remove', target=str(row['id'])))
+
+    def test_worker_authentication_deadline_and_recovery(self):
+        import socket
+        import struct
+        import threading
+        from terrence.client import connect_worker
+        from terrence.worker import accept_worker
+
+        for partial in (b'', b'\x00', struct.pack('!i', 100) + b'x'):
+            with self.subTest(partial=partial), socket.socket() as listener:
+                listener.bind(('127.0.0.1', 0))
+                listener.listen()
+                listener.settimeout(2)
+                errors = []
+                expired = threading.Event()
+
+                def server():
+                    try:
+                        with self.assertRaises(TimeoutError):
+                            accept_worker(listener, b'test', timeout=.1)
+                        expired.set()
+                        with accept_worker(listener, b'test') as connection:
+                            self.assertEqual(connection.recv_bytes(), b'ping')
+                            connection.send_bytes(b'pong')
+                    except BaseException as error:
+                        errors.append(error)
+
+                thread = threading.Thread(target=server)
+                thread.start()
+                try:
+                    with socket.create_connection(listener.getsockname()) as stalled:
+                        stalled.recv(1024)  # Wait until the worker sends its challenge.
+                        if partial:
+                            stalled.sendall(partial)
+                        self.assertTrue(expired.wait(1), 'Authentication did not time out')
+                        with connect_worker(listener.getsockname(), b'test', timeout=2) as connection:
+                            connection.send_bytes(b'ping')
+                            self.assertTrue(connection.poll(2))
+                            self.assertEqual(connection.recv_bytes(), b'pong')
+                finally:
+                    thread.join(3)
+                self.assertFalse(thread.is_alive())
+                if errors:
+                    raise errors[0]
+
     def test_remove_keeps_files_and_ids_are_not_reused(self):
         self.add()
         self.engine.dispatch(dict(command='stop', target='1'))

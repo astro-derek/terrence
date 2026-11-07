@@ -4,16 +4,59 @@ from pathlib import Path
 import secrets
 import shutil
 import socket
+import struct
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing.connection import Listener
+from multiprocessing.connection import Connection, answer_challenge, deliver_challenge
 from multiprocessing import AuthenticationError
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import libtorrent as lt
 from .settings import DEFAULTS, read_settings, validate, validate_copy_to
+
+
+def accept_worker(listener, key, timeout=1):
+    sock, _ = listener.accept()
+    deadline = time.monotonic() + timeout
+
+    class Handshake:
+        def receive(self, length):
+            chunks = bytearray()
+            while len(chunks) < length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('Worker authentication timed out')
+                sock.settimeout(remaining)
+                chunk = sock.recv(length - len(chunks))
+                if not chunk:
+                    raise EOFError
+                chunks.extend(chunk)
+            return bytes(chunks)
+
+        def send_bytes(self, data):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Worker authentication timed out')
+            sock.settimeout(remaining)
+            sock.sendall(struct.pack('!i', len(data)) + data)
+
+        def recv_bytes(self, maxlength=1024 * 1024):
+            length, = struct.unpack('!i', self.receive(4))
+            if length < 0 or length > maxlength:
+                raise OSError('Invalid authentication frame length')
+            return self.receive(length)
+
+    try:
+        handshake = Handshake()
+        deliver_challenge(handshake, key)
+        answer_challenge(handshake, key)
+        sock.setblocking(True)
+        return Connection(sock.detach())
+    finally:
+        sock.close()
 
 
 def write_json(path, value):
@@ -74,6 +117,7 @@ class Engine:
         params.save_path = str(self.download_path(row))
         params.flags &= ~lt.torrent_flags.auto_managed
         params.flags &= ~lt.torrent_flags.paused
+        params.flags |= lt.torrent_flags.duplicate_is_error
         return params
 
     def attach(self, row):
@@ -336,7 +380,9 @@ class Engine:
             params = self.params(row)
             hashes = params.ti.info_hashes() if params.ti else params.info_hashes
             fingerprint = [str(hashes.v1), str(hashes.v2)]
-            if any(r.get('fingerprint') == fingerprint for r in self.state['torrents']):
+            if any(any(int(value, 16) and value == existing
+                       for value, existing in zip(fingerprint, r.get('fingerprint', [])))
+                   for r in self.state['torrents']):
                 if row['kind'] == 'torrent':
                     (self.directory / f'{number}.torrent').unlink(missing_ok=True)
                 raise ValueError('Torrent is already managed')
@@ -419,17 +465,19 @@ def main():
             return
         engine = Engine(root)
         key = secrets.token_bytes(32)
-        with Listener(('127.0.0.1', 0), authkey=key) as listener:
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen(128)
             endpoint = directory / 'endpoint.json'
-            write_json(endpoint, {'port': listener.address[1], 'key': key.hex()})
+            write_json(endpoint, {'port': listener.getsockname()[1], 'key': key.hex()})
             if os.name != 'nt':
                 endpoint.chmod(0o600)
             # A timeout lets completion handling run even when no CLI is connected.
-            listener._listener._socket.settimeout(.5)
+            listener.settimeout(.5)
             try:
                 while engine.running:
                     try:
-                        connection = listener.accept()
+                        connection = accept_worker(listener, key)
                     except (socket.timeout, AuthenticationError, EOFError, OSError):
                         with engine.lock:
                             engine.tick(background=True)
